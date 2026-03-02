@@ -1,0 +1,367 @@
+
+import pandas as pd
+import numpy as np
+import xarray as xr
+from typing import Union
+from datetime import datetime, timezone
+import warnings
+warnings.filterwarnings('ignore')
+import cftime
+
+
+
+
+
+class Client:
+    """
+    Client for the google cloud cmip6 api. This class contains methods for exploring and retrieving data.
+    Requirements: installation of google cloud library gcsfs and zarr
+    """
+
+    def __init__(self):
+        # API credentials and urls
+        self.catalogue = 'https://storage.googleapis.com/cmip6/cmip6-zarr-consolidated-stores.csv'
+
+
+    def get_catalogue(self) -> pd.DataFrame:
+        """
+        Returns a Pandas Dataframe with metadata of all available CMIP6 model runs in the Google storage
+
+        :return: catalogue
+
+        Example:
+            >>> from mew_weather_and_climate_sdk.climate.cmip6.gcp import Client
+            >>> c = Client()
+            >>> cat = c.get_catalogue() 
+        """
+
+        return pd.read_csv(self.catalogue)
+
+
+    def _standardise_longitude(self, ds: xr.Dataset) -> xr.Dataset:
+        """
+        Returns data where the longitude coords go between -180,180, independently of the input data layout. For n_da in the example below, coords will be [-2,-1,0,1] and data will be [3,4,1,2]
+
+        :param ds: Xarray Dataset, required to have a coord named "lon"
+
+        :return: Xarray Dataset with altered lon coord and data along that dimension
+
+        Example:
+            >>> import xarray as xr
+            >>> from mew_weather_and_climate_sdk.climate.cmip6.gcp import Client
+            >>> c = Client()
+            >>> ex_da = xr.DataArray(np.array([1,2,3,4]), coords=[np.array([0, 1, 358, 359])], dims="lon")
+            >>> n_da = c._standardise_longitude(da = ex_da)
+        """
+
+        ds_lon = ds.assign_coords(lon=(((ds.lon + 180) % 360) - 180))
+        ds_lon = ds_lon.reindex({"lon": sorted(ds_lon.lon)})
+        return ds_lon
+
+
+    def find_simulations(self, activity_id : Union[str, None] = None, source_id: Union[str, None] = None, experiment_id: Union[str, None] = None,member_id: Union[str, None] = None, table_id: Union[str, None] = None, variable_id: Union[str, None] = None, grid_label: Union[str, None] = None) -> pd.DataFrame:
+        """
+        Returns a filtered version of the catalogue obtained in get_catalogue() based on which column names are taken as input and what rows in the catalogue those
+        names correspond to. The returned dataframe is the intersection of the different filters. Inputs to this method are all optional and each 
+        corresponds to a column name of the catalogue.
+
+        :param activity_id: Activity identity, the type of model run
+        :param source_id: Source identity, the name of the coupled model 
+        :param experiment_id: Experiment identity
+        :param member_id: Member identity, combination of the realisation, initialisation method, physics and forcing of the model, given as "rXiXpXfX" (e.g. r1i2p1f4)
+        :param table_id: Table identity, combination of regime- and temporal resolution designation (e.g. Amon equals "Atmosphere montly")
+        :param variable_id: Variable identity, model variable names
+        :param grid_label: the type of grid the model is run on
+
+        :return: filtered catalogue
+
+        Example:
+            >>> from mew_weather_and_climate_sdk.climate.cmip6.gcp import Client
+            >>> c = Client()
+            >>> strict_filtered = c.find_simulations(activity_id = "CMIP", source_id = "GFDL-ESM4", experiment_id = "abrupt-4xCO2", member_id = "r1i1p1f1", table_id = "Amon", variable_id = "tas", grid_label = "gr1")
+            >>> loose_filtered = c.find_simulations(experiment_id = "ssp245", variable_id = "tas")
+        """
+
+        filtered_df = self.get_catalogue()
+        if activity_id:
+            filtered_df = filtered_df[filtered_df['activity_id']==activity_id]
+        if source_id:
+            filtered_df = filtered_df[filtered_df['source_id']==source_id]
+        if experiment_id:
+            filtered_df = filtered_df[filtered_df['experiment_id']==experiment_id]
+        if member_id:
+            filtered_df = filtered_df[filtered_df['member_id']==member_id]
+        if table_id:
+            filtered_df = filtered_df[filtered_df['table_id']==table_id]
+        if variable_id:
+            filtered_df = filtered_df[filtered_df['variable_id']==variable_id]
+        if grid_label:
+            filtered_df = filtered_df[filtered_df['grid_label']==grid_label]
+
+        return filtered_df
+
+
+    def get_single_simulation(self, zstore:str) -> xr.Dataset:
+        """
+        Reads data for one zstore of given DataFrame and returns xarray
+
+        :param zstore: url to download given variable of a specific model run
+
+        :return: Xarray dataset with gridded model data
+
+        Example:
+            >>> from mew_weather_and_climate_sdk.climate.cmip6.gcp import Client
+            >>> c = Client()
+            >>> sim = c.get_single_simulation(zstore = "gs://cmip6/CMIP6/ScenarioMIP/NOAA-GFDL/GFDL-CM4/ssp245/r1i1p1f1/AERmon/abs550aer/gr1/v20180701/")
+        """
+
+        ds = xr.open_zarr(zstore, consolidated=True)
+
+        #set the longitude coordinate and transform data if needed
+        ds_altered = self._standardise_longitude(ds)
+
+        return ds_altered
+
+
+    def get_simulation_data(self, item_df: pd.DataFrame) -> Union[xr.Dataset,None]:
+        """
+        Takes a single row dataframe (with at leat a column named "zstore") and outputs the gridded model data of the corresponding to the zstore url.
+
+        :param item_df: Single row dataframe
+
+        :return: Xarray dataset with gridded model data, or None
+
+        Example:
+            >>> c = Client()
+            >>> strict_filtered = c.find_simulations(activity_id = "CMIP", source_id = "GFDL-ESM4", experiment_id = "abrupt-4xCO2", member_id = "r1i1p1f1", table_id = "Amon", variable_id = "tas", grid_label = "gr1")
+            >>> sim = c.get_simulation_data(item_df = strict_filtered)
+        """
+
+        zstore = item_df.zstore
+
+        if isinstance(zstore, str):
+            return self.get_single_simulation(zstore)
+        else:
+            print('only one simulation can be read with this function. Use get_simulation_data_multi alternatively.')
+            pass
+
+
+    def get_simulation_data_multi(self, catalogue_df: pd.DataFrame) -> dict:
+        """
+        Reads data from all zstores of given DataFrame and returns xarrays in dictionary with keys
+        corresponding to model simulation. if two simulations are equal, the first will be overwritten.
+
+        :param catalogue_df: Multi row dataframe
+
+        :return: dictionary of xarray datasets with gridded model data
+
+        Example:
+            >>> c = Client()
+            >>> loose_filtered = c.find_simulations(experiment_id = "ssp245", variable_id = "tas")
+            >>> sims = c.get_simulation_data_multi(catalogue_df = loose_filtered)
+        """
+
+        ds_dict = {}
+        for z in np.arange(len(catalogue_df)):
+            single_sim = catalogue_df.iloc[z]
+            ds = self.get_single_simulation(single_sim.zstore)
+            ds_dict[single_sim.source_id+'_'+single_sim.experiment_id+'_'+single_sim.member_id+'_'+single_sim.variable_id+'_'+single_sim.table_id] = ds
+
+        return ds_dict
+
+    def get_project_selection(self, subset_catalogue_df: pd.DataFrame, variable_id: Union[str, None] = None) -> dict:
+        """
+        Reads data from all zstores of selected catalogue DataFrame and returns xarrays in dictionary with keys
+        corresponding to model simulation. Both the historical data and projection data are fetched,
+        and concatenated in time.
+
+        :param subset_catalogue_df: dataframe with climate model run metadata
+        :param variable_id: If given, will filter out all rows where variable_id does not match
+
+        :return: dictionary of xarray datasets
+
+        Example:
+            >>> c = Client()
+            >>> model_metadata = c.find_simulations(source_id = "GFDL-CM4", experiment_id = "ssp245", grid_label = "gr1")
+            >>> # Get all variables from the model run we've fetched metadata for in model_metadata
+            >>> all_variables = c.get_project_selection(subset_catalogue_df = model_metadata)
+            >>> # Get only one variable
+            >>> one_variable = c.get_project_selection(subset_catalogue_df = model_metadata, variable_id = "tas")
+        """
+
+        datasets = {}
+        for z in np.arange(len(subset_catalogue_df)):
+            single_sim = subset_catalogue_df.iloc[z]
+            if not variable_id:
+                variable_id= single_sim.variable_id
+            print('Fetching data for '+subset_catalogue_df.iloc[z]['source_id']+' and variable '+ variable_id)
+            df_hist = self.find_simulations(source_id=single_sim.source_id,
+                            experiment_id='historical',
+                            member_id=single_sim.member_id,
+                            table_id=single_sim.table_id,
+                            variable_id=variable_id,
+                            grid_label=single_sim.grid_label)
+            da_hist = self.get_simulation_data(df_hist.iloc[0])
+            df_fut = self.find_simulations(source_id=single_sim.source_id,
+                        experiment_id=single_sim.experiment_id,
+                        member_id=single_sim.member_id,
+                        table_id=single_sim.table_id,
+                        variable_id=variable_id,
+                        grid_label=single_sim.grid_label)   
+            da_fut = self.get_simulation_data(df_fut.iloc[0])     
+            ds = xr.concat([da_hist,da_fut],dim='time')
+            datasets[single_sim.source_id+'_'+single_sim.member_id+'_'+variable_id+'_'+single_sim.table_id] = ds
+            
+        return datasets
+
+
+    def _cftime_to_timestamp(self,ts):
+        """
+        Convert pandas cftime.DatetimeGregorian (timezone-naive) -> Timestamp.
+        - Return None for NaT.
+        """
+        if ts is pd.NaT:
+            return None
+        if getattr(ts, "tz", None) is not None:
+            ts = ts.tz_convert("UTC").tz_localize(None)
+        return pd.Timestamp(
+            ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second, ts.microsecond
+            )
+
+
+    def _timestamp_to_cftime(self,ts: pd.Timestamp):
+        """
+        Convert pandas Timestamp -> cftime.DatetimeGregorian (timezone-naive).
+        - If tz-aware, convert to UTC then drop tz (cftime has no tz info).
+        - Return None for NaT.
+        """
+        if ts is pd.NaT:
+            return None
+        if getattr(ts, "tz", None) is not None:
+            ts = ts.tz_convert("UTC").tz_localize(None)
+        return cftime.DatetimeGregorian(
+            ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second, ts.microsecond
+            )
+    
+
+    def extract_point_location_time(self, df_dict: dict, variable: str, lat: float, lon: float, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+        """
+        Returns a Pandas dataframe with the timeseries for all the models for a single point location and given time interval
+
+        :param ds_dict: A dictionary of Xarray datasets
+        :param variable: The variable that the output dataframe will consist of
+        :param lat: latitude value between -90 and 90
+        :param lon: longitude value between -180 and 180
+        :param start_date: datetime of when to start the timeseries
+        :param end_date: datetime of when to end the timeseries
+
+        :return: Pandas dataframe 
+
+        Example:
+            >>> from datetime import datetime
+            >>> c = Client()
+            >>> model_metadata = c.find_simulations(experiment_id = "ssp245")
+            >>> # Get all variables from the model run we've fetched metadata for in model_metadata
+            >>> all_variables = c.get_project_selection(subset_catalogue_df = model_metadata)
+            >>> period = [datetime(2005, 1, 1), datetime(2045, 1, 1)]
+            >>> point_data = c.extract_point_location_time(ds_dict = all_variables, variable = "tas", lat = 68.8, lon = 16.5, start_date = period[0], end_date = period[1])
+        """
+
+        dataset = []
+        for model in df_dict.keys():
+            print('Formatting model:'+model)
+            # Get nearest point to project location
+            df_point = df_dict[model].sel(lat=lat,lon = lon, method="nearest")
+            # Slice period of interest
+            try:
+                df_point_calendar = df_point.convert_calendar(calendar='standard',align_on='date')
+            except:
+                # We might have different types of time
+                t = df_point['time'].values  # object array of date-like objects
+                types = np.array([type(v) for v in t])
+                # Index of the first change (i.e., where type[i] != type[i-1])
+                first_change_idx = np.flatnonzero(types[1:] != types[:-1])[0] + 1
+                print(first_change_idx, t[first_change_idx], types[first_change_idx])
+                # Part 1: Awareness of datetime --> Timestamp -> datetime
+                df_point_1 = df_point.isel(time=slice(0, first_change_idx))
+                df_point_1['time'] = df_point_1['time'].astype('datetime64[ns]')
+                df_point_calendar1 = df_point_1.convert_calendar(calendar="standard", align_on="date")
+                # Part 2 : cftime to timestamp and datetime 
+                df_point_2 = df_point.isel(time=slice(first_change_idx,None))
+                tvals = df_point_2["time"].values 
+                t_datetime = np.array([self._cftime_to_timestamp(t) for t in tvals], dtype=object)
+                df_point_2 = df_point_2.assign_coords(time=("time", t_datetime))
+                df_point_2['time'] = df_point_2['time'].astype('datetime64[ns]')
+                df_point_calendar2 = df_point_2.convert_calendar(calendar='standard',align_on='date')
+                # Join again
+                df_point_calendar = xr.concat([df_point_calendar1, df_point_calendar2], dim="time")
+            
+            # At this point df_point_calendar must be defined
+            if df_point_calendar is None:
+                raise ValueError(f"Calendar conversion resulted in None for model '{model}'.")
+
+            # In case of overlapped dates; historical values are considered
+            _, index = np.unique(df_point_calendar['time'], return_index=True)
+            df_point_calendar = df_point_calendar.isel(time=index)
+            df_slice = df_point_calendar.sel(time=slice(start_date,end_date))
+            # to dataframe - some formatting
+            df = df_slice[variable].to_dataframe().reset_index()
+            df.set_index('time',inplace=True)
+            df.index=df.index.astype('datetime64[ns]') 
+            # Get rid of hour information
+            df.index = df.index.normalize()
+            columns_to_keep= [variable]
+            df = df[columns_to_keep]
+            df.columns = [model]
+            dataset.append(df)
+
+        return pd.concat(dataset, axis=1)
+   
+
+    def extract_box_time(self,data:xr.Dataset,latlonbox:list,start_date:datetime,end_date:datetime,aggregation_method:Union[None,str],spatial_mean:bool)-> xr.Dataset:
+        """
+        Return a dataset with the timeseries for all the models 
+        
+        :param data: Xarray dataset
+        :param latlonbox: list of lat and lon values, [lat_min, lat_max, lon_min, lon_max]
+        :param start_date: datetime for the start date
+        :param end_date: datetime for the end date
+        :param aggregation_method: Optional, either "monthly_sum" or "monthly_mean"
+        :param spatial_mean: if True, the mean over the lat an lon dimensions of the box will be returned
+
+        :return: Temporally and laterally (potenially averaged) sliced Xarray dataset
+
+        Example:
+            >>> c = Client()
+            >>> strict_filtered = c.find_simulations(activity_id = "CMIP", source_id = "GFDL-ESM4", experiment_id = "abrupt-4xCO2", member_id = "r1i1p1f1", table_id = "Amon", variable_id = "tas", grid_label = "gr1")
+            >>> sim = c.get_simulation_data(item_df = strict_filtered)
+            >>> coordinate_box = [-40,10,-20,30]
+            >>> boxed_ds = c.extract_box_time(data = strict_filtered, latlonbox= coordinate_box, start_date = datetime(2005, 1, 1), end_date = datetime(2045, 1, 1), aggregation_method = "monthly_mean",spatial_mean = False)
+        """
+
+        # Slice period of interest
+        data_calendar = data.convert_calendar(calendar='standard',align_on='date')
+
+        # In case of overlapped dates; historical values are considered
+        _, index = np.unique(data_calendar['time'], return_index=True)
+        data_calendar = data_calendar.isel(time=index)
+        df_slice = data_calendar.sel(time=slice(start_date,end_date))
+
+        if aggregation_method:
+            if aggregation_method=='monthly_mean':
+                data_monthly=df_slice.resample(time="MS").mean()
+            elif aggregation_method=='monthly_sum':
+                data_monthly=df_slice.resample(time="MS").sum()
+            else:
+                print("Aggregation method must be either 'monthly_mean', 'monthly_sum' or None.")
+                pass
+            # extract box
+            data_box = data_monthly.sel(lat=slice(latlonbox[0],latlonbox[1]),lon=slice(latlonbox[2],latlonbox[3]))
+        
+        else:
+            data_box = df_slice.sel(lat=slice(latlonbox[0],latlonbox[1]),lon=slice(latlonbox[2],latlonbox[3]))
+
+        if spatial_mean:
+            data_box = data_box.mean(dim=['lat','lon'])
+
+        return data_box
